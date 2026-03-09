@@ -46,7 +46,9 @@ export class AdapterError extends Error {
   }
 }
 
-const DEFAULT_TIMEOUT = 30_000
+const DEFAULT_TIMEOUT = 60_000
+const ASK_TIMEOUT = 120_000
+const DEFAULT_BL = 'boq_labs-tailwind-frontend_20260301.03_p0'
 
 export class NotebookLMAdapter {
   private session: SessionManager
@@ -232,8 +234,12 @@ export class NotebookLMAdapter {
       sourcesArray,
       question,
       conversationHistory,
-      [2, null, [1]],
+      [2, null, [1], [1]],
       conversationId,
+      null,
+      null,
+      notebookId,
+      1,
     ]
 
     const auth = this.session.getAuth()
@@ -249,7 +255,7 @@ export class NotebookLMAdapter {
 
     this.reqIdCounter += 100000
     const urlParams = new URLSearchParams({
-      bl: process.env.NOTEBOOKLM_BL || 'boq_labs-tailwind-frontend_20251221.14_p0',
+      bl: process.env.NOTEBOOKLM_BL || DEFAULT_BL,
       hl: 'en',
       _reqid: String(this.reqIdCounter),
       rt: 'c',
@@ -261,7 +267,7 @@ export class NotebookLMAdapter {
     const url = `${QUERY_URL}?${urlParams.toString()}`
 
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT)
+    const askTimeout = setTimeout(() => controller.abort(), ASK_TIMEOUT)
 
     try {
       const response = await fetch(url, {
@@ -311,7 +317,7 @@ export class NotebookLMAdapter {
         'UNKNOWN_UPSTREAM_ERROR'
       )
     } finally {
-      clearTimeout(timeout)
+      clearTimeout(askTimeout)
     }
   }
 
