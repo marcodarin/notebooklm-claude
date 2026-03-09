@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: notebooklm-mcp-bridge
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: LOG_LEVEL
+        value: info
+      - key: MCP_AUTH_TOKEN
+        sync: false
+      - key: GOOGLE_SERVICE_ACCOUNT_MODE
+        value: browser
+      - key: HEADLESS
+        value: "true"
+      - key: NOTEBOOKLM_DEFAULT_NOTEBOOK_URL
+        sync: false
+      - key: SESSION_STORE_PATH
+        value: /tmp/notebooklm-session
+    healthCheckPath: /health
+    numInstances: 1
+    region: frankfurt
