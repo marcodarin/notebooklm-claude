@@ -1,10 +1,9 @@
 """
-Script to login to NotebookLM and save session cookies.
-Opens a Chromium browser, waits for Google login, then saves storage state.
+Login to NotebookLM and save session cookies.
+Uses a persistent browser profile so Google doesn't block the sign-in.
 """
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -13,33 +12,47 @@ async def main():
         from playwright.async_api import async_playwright
     except ImportError:
         print("ERROR: playwright not installed")
+        print("  pip install playwright")
+        print("  python -m playwright install chromium")
         sys.exit(1)
 
     storage_dir = Path.home() / ".notebooklm"
     storage_dir.mkdir(exist_ok=True)
     storage_path = storage_dir / "storage_state.json"
+    profile_dir = str(storage_dir / "browser_profile")
 
     print(f"Storage will be saved to: {storage_path}")
-    print("Opening browser... Please log in to your Google account.")
-    print("Once you see the NotebookLM homepage with your notebooks, close the browser window.")
+    print()
+    print("Opening browser with persistent profile...")
+    print("Log in to your Google account normally.")
+    print("Once you see the NotebookLM homepage with your notebooks,")
+    print("close the browser window.")
     print()
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=False)
-        context = await browser.new_context()
-        page = await context.new_page()
+        context = await p.chromium.launch_persistent_context(
+            profile_dir,
+            headless=False,
+            channel="chromium",
+            args=[
+                "--disable-blink-features=AutomationControlled",
+            ],
+            ignore_default_args=["--enable-automation"],
+            viewport={"width": 1280, "height": 900},
+            locale="it-IT",
+        )
 
+        page = context.pages[0] if context.pages else await context.new_page()
         await page.goto("https://notebooklm.google.com/")
+
         print("Waiting for NotebookLM to load after login...")
         print("(Close the browser window when you see your notebooks)")
 
         try:
-            # Wait until we're on the NotebookLM page (not redirected to login)
             while True:
                 await asyncio.sleep(2)
                 url = page.url
                 if "notebooklm.google.com" in url and "accounts.google.com" not in url:
-                    # Check if page has loaded properly
                     title = await page.title()
                     if "NotebookLM" in title:
                         print(f"NotebookLM loaded! URL: {url}")
@@ -52,10 +65,10 @@ async def main():
         with open(storage_path, "w") as f:
             json.dump(storage, f, indent=2)
 
-        print(f"Session saved to {storage_path}")
+        print(f"\nSession saved to {storage_path}")
         print(f"Cookie count: {len(storage.get('cookies', []))}")
-        await browser.close()
+        await context.close()
 
-    print("\nDone! You can now start the MCP server.")
+    print("\nDone! Send the file to the server admin.")
 
 asyncio.run(main())
