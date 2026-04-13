@@ -70,7 +70,10 @@ export class NotebookLMAdapter {
       withRetry(
         () => this.doRpcCall(method, params, sourcePath, allowNull),
         `rpc:${method}`,
-        { maxRetries: 2 }
+        {
+          maxRetries: 2,
+          onAuthExpired: () => this.session.refreshTokens(),
+        }
       )
     )
   }
@@ -242,82 +245,102 @@ export class NotebookLMAdapter {
       1,
     ]
 
-    const auth = this.session.getAuth()
-    const paramsJson = JSON.stringify(params)
-    const fReq = [null, paramsJson]
-    const fReqJson = JSON.stringify(fReq)
+    let authRefreshed = false
+    const doAsk = async (): Promise<AskResult> => {
+      const auth = this.session.getAuth()
+      const paramsJson = JSON.stringify(params)
+      const fReq = [null, paramsJson]
+      const fReqJson = JSON.stringify(fReq)
 
-    const bodyParts = [`f.req=${encodeURIComponent(fReqJson)}`]
-    if (auth.csrfToken) {
-      bodyParts.push(`at=${encodeURIComponent(auth.csrfToken)}`)
-    }
-    const body = bodyParts.join('&') + '&'
+      const bodyParts = [`f.req=${encodeURIComponent(fReqJson)}`]
+      if (auth.csrfToken) {
+        bodyParts.push(`at=${encodeURIComponent(auth.csrfToken)}`)
+      }
+      const body = bodyParts.join('&') + '&'
 
-    this.reqIdCounter += 100000
-    const urlParams = new URLSearchParams({
-      bl: process.env.NOTEBOOKLM_BL || DEFAULT_BL,
-      hl: 'en',
-      _reqid: String(this.reqIdCounter),
-      rt: 'c',
-    })
-    if (auth.sessionId) {
-      urlParams.set('f.sid', auth.sessionId)
-    }
-
-    const url = `${QUERY_URL}?${urlParams.toString()}`
-
-    const controller = new AbortController()
-    const askTimeout = setTimeout(() => controller.abort(), ASK_TIMEOUT)
-
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
-          Cookie: buildCookieHeader(auth.cookies),
-        },
-        body,
-        signal: controller.signal,
+      this.reqIdCounter += 100000
+      const urlParams = new URLSearchParams({
+        bl: process.env.NOTEBOOKLM_BL || DEFAULT_BL,
+        hl: 'en',
+        _reqid: String(this.reqIdCounter),
+        rt: 'c',
       })
-
-      if (response.status === 401 || response.status === 403) {
-        throw new AdapterError('Authentication expired or forbidden', 'AUTH_EXPIRED')
+      if (auth.sessionId) {
+        urlParams.set('f.sid', auth.sessionId)
       }
 
-      if (!response.ok) {
+      const url = `${QUERY_URL}?${urlParams.toString()}`
+
+      const controller = new AbortController()
+      const askTimeout = setTimeout(() => controller.abort(), ASK_TIMEOUT)
+
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8',
+            Cookie: buildCookieHeader(auth.cookies),
+          },
+          body,
+          signal: controller.signal,
+        })
+
+        if (response.status === 401 || response.status === 403) {
+          throw new AdapterError('Authentication expired or forbidden', 'AUTH_EXPIRED')
+        }
+
+        if (!response.ok) {
+          throw new AdapterError(
+            `HTTP ${response.status}: ${response.statusText}`,
+            'UNKNOWN_UPSTREAM_ERROR'
+          )
+        }
+
+        const responseText = await response.text()
+        const answerText = parseAskResponse(responseText)
+
+        let turnNumber = 0
+        if (answerText) {
+          const turns = this.conversationCache.get(conversationId!) || []
+          turnNumber = turns.length + 1
+          turns.push({ query: question, answer: answerText, turnNumber })
+          this.conversationCache.set(conversationId!, turns)
+        }
+
+        return {
+          answer: answerText || 'No answer could be extracted from the response.',
+          conversationId: conversationId!,
+          turnNumber,
+        }
+      } catch (err) {
+        if (err instanceof AdapterError) throw err
+        if (err instanceof DOMException && err.name === 'AbortError') {
+          throw new AdapterError('Request timed out', 'NOTEBOOKLM_TIMEOUT')
+        }
         throw new AdapterError(
-          `HTTP ${response.status}: ${response.statusText}`,
+          `Ask failed: ${err instanceof Error ? err.message : String(err)}`,
           'UNKNOWN_UPSTREAM_ERROR'
         )
+      } finally {
+        clearTimeout(askTimeout)
       }
+    }
 
-      const responseText = await response.text()
-      const answerText = parseAskResponse(responseText)
-
-      let turnNumber = 0
-      if (answerText) {
-        const turns = this.conversationCache.get(conversationId!) || []
-        turnNumber = turns.length + 1
-        turns.push({ query: question, answer: answerText, turnNumber })
-        this.conversationCache.set(conversationId!, turns)
-      }
-
-      return {
-        answer: answerText || 'No answer could be extracted from the response.',
-        conversationId: conversationId!,
-        turnNumber,
-      }
+    try {
+      return await doAsk()
     } catch (err) {
-      if (err instanceof AdapterError) throw err
-      if (err instanceof DOMException && err.name === 'AbortError') {
-        throw new AdapterError('Request timed out', 'NOTEBOOKLM_TIMEOUT')
+      if (err instanceof AdapterError && err.code === 'AUTH_EXPIRED' && !authRefreshed) {
+        authRefreshed = true
+        logger.info('ask_notebook: AUTH_EXPIRED, attempting token refresh and retry')
+        try {
+          await this.session.refreshTokens()
+        } catch (refreshErr) {
+          logger.error({ refreshErr }, 'Token refresh failed during ask_notebook retry')
+          throw err
+        }
+        return await doAsk()
       }
-      throw new AdapterError(
-        `Ask failed: ${err instanceof Error ? err.message : String(err)}`,
-        'UNKNOWN_UPSTREAM_ERROR'
-      )
-    } finally {
-      clearTimeout(askTimeout)
+      throw err
     }
   }
 

@@ -36,11 +36,25 @@ function authMiddleware (
 }
 
 app.get('/health', (_req, res) => {
+  const status = sessionManager.getStatus()
   res.json({
     status: 'ok',
     uptime: Math.floor(process.uptime()),
     version: '0.1.0',
-    notebooklm: sessionManager.isInitialized() ? 'connected' : 'disconnected',
+    notebooklm: status.initialized ? 'connected' : 'disconnected',
+    session: {
+      lastTokenRefresh: status.lastTokenRefresh
+        ? new Date(status.lastTokenRefresh).toISOString()
+        : null,
+      tokenAgeSec: status.tokenAge,
+      cookieExpiry: status.cookieExpiry
+        ? new Date(status.cookieExpiry).toISOString()
+        : null,
+      nextRefresh: status.nextRefresh
+        ? new Date(status.nextRefresh).toISOString()
+        : null,
+      refreshCount: status.refreshCount,
+    },
   })
 })
 
@@ -56,6 +70,42 @@ async function initializeNotebookLM (): Promise<void> {
     logger.warn({ err }, 'NotebookLM adapter not available. Only ping tool will work. Set NOTEBOOKLM_AUTH_JSON or provide storage_state.json to enable notebook tools.')
   }
 }
+
+app.post('/admin/update-cookies', authMiddleware, async (req, res) => {
+  const storageState = req.body
+
+  if (!storageState || !storageState.cookies || !Array.isArray(storageState.cookies)) {
+    res.status(400).json({ error: 'Request body must be a Playwright storage_state.json object with a cookies array' })
+    return
+  }
+
+  try {
+    await sessionManager.updateCookies(JSON.stringify(storageState))
+
+    if (!adapter) {
+      adapter = new NotebookLMAdapter(sessionManager)
+      logger.info('NotebookLM adapter created after cookie update')
+    }
+
+    const status = sessionManager.getStatus()
+    res.json({
+      status: 'ok',
+      message: 'Cookies updated and tokens refreshed',
+      session: {
+        lastTokenRefresh: status.lastTokenRefresh
+          ? new Date(status.lastTokenRefresh).toISOString()
+          : null,
+        refreshCount: status.refreshCount,
+      },
+    })
+  } catch (err) {
+    logger.error({ err }, 'Failed to update cookies')
+    res.status(500).json({
+      error: 'Failed to update cookies',
+      message: err instanceof Error ? err.message : String(err),
+    })
+  }
+})
 
 function createConfiguredServer () {
   const server = createMcpServer()

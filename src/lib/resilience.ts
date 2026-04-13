@@ -5,6 +5,7 @@ export interface RetryOptions {
   baseDelayMs: number
   maxDelayMs: number
   retryableCheck?: (err: unknown) => boolean
+  onAuthExpired?: () => Promise<void>
 }
 
 const DEFAULT_RETRY_OPTIONS: RetryOptions = {
@@ -21,6 +22,8 @@ export async function withRetry<T> (
   const opts = { ...DEFAULT_RETRY_OPTIONS, ...options }
 
   let lastError: unknown
+  let authRefreshAttempted = false
+
   for (let attempt = 0; attempt <= opts.maxRetries; attempt++) {
     try {
       return await fn()
@@ -31,11 +34,29 @@ export async function withRetry<T> (
         throw err
       }
 
-      const nonRetryableCodes = ['AUTH_EXPIRED', 'NOTEBOOK_NOT_FOUND', 'NOTEBOOK_ACCESS_DENIED']
-      if (err && typeof err === 'object' && 'code' in err) {
-        if (nonRetryableCodes.includes((err as { code: string }).code)) {
+      const errCode = err && typeof err === 'object' && 'code' in err
+        ? (err as { code: string }).code
+        : null
+
+      const hardNonRetryable = ['NOTEBOOK_NOT_FOUND', 'NOTEBOOK_ACCESS_DENIED']
+      if (errCode && hardNonRetryable.includes(errCode)) {
+        throw err
+      }
+
+      if (errCode === 'AUTH_EXPIRED' && opts.onAuthExpired && !authRefreshAttempted) {
+        authRefreshAttempted = true
+        logger.info({ label }, 'AUTH_EXPIRED detected, attempting token refresh before retry')
+        try {
+          await opts.onAuthExpired()
+          continue
+        } catch (refreshErr) {
+          logger.error({ label, refreshErr }, 'Token refresh failed, giving up')
           throw err
         }
+      }
+
+      if (errCode === 'AUTH_EXPIRED') {
+        throw err
       }
 
       if (attempt < opts.maxRetries) {

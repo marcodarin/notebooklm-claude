@@ -10,6 +10,15 @@ export interface AuthTokens {
   sessionId: string
 }
 
+export interface SessionStatus {
+  initialized: boolean
+  lastTokenRefresh: number | null
+  tokenAge: number | null
+  cookieExpiry: number | null
+  nextRefresh: number | null
+  refreshCount: number
+}
+
 const CSRF_REGEX = /"SNlM0e"\s*:\s*"([^"]+)"/
 const SESSION_ID_REGEX = /"FdrFJe"\s*:\s*"([^"]+)"/
 
@@ -70,10 +79,16 @@ export async function fetchTokens (cookies: Record<string, string>): Promise<{ c
   }
 }
 
+const TOKEN_REFRESH_INTERVAL_MS = 25 * 60 * 1000
+
 export class SessionManager {
   private auth: AuthTokens | null = null
   private storagePath: string
   private tokenRefreshInterval: ReturnType<typeof setInterval> | null = null
+  private pendingRefresh: Promise<void> | null = null
+  private lastTokenRefreshTs: number | null = null
+  private refreshCount = 0
+  private rawStorageState: object | null = null
 
   constructor (storagePath?: string) {
     this.storagePath = storagePath || process.env.SESSION_STORE_PATH || '/tmp/notebooklm-session'
@@ -85,6 +100,7 @@ export class SessionManager {
 
     if (authJson) {
       const storageState = JSON.parse(authJson)
+      this.rawStorageState = storageState
       cookies = extractCookiesFromStorage(storageState)
     } else {
       const storagePath = `${this.storagePath}/storage_state.json`
@@ -97,26 +113,70 @@ export class SessionManager {
       }
       const raw = await readFile(storagePath, 'utf-8')
       const storageState = JSON.parse(raw)
+      this.rawStorageState = storageState
       cookies = extractCookiesFromStorage(storageState)
     }
 
     const { csrfToken, sessionId } = await fetchTokens(cookies)
     this.auth = { cookies, csrfToken, sessionId }
+    this.lastTokenRefreshTs = Date.now()
+    this.refreshCount++
     logger.info('NotebookLM session initialized successfully')
+
+    this.startKeepAlive()
   }
 
+  /**
+   * Deduplicated token refresh: concurrent callers share a single in-flight request.
+   */
   async refreshTokens (): Promise<void> {
+    if (!this.auth) throw new Error('Session not initialized')
+
+    if (this.pendingRefresh) {
+      return this.pendingRefresh
+    }
+
+    this.pendingRefresh = this.doRefreshTokens()
+    try {
+      await this.pendingRefresh
+    } finally {
+      this.pendingRefresh = null
+    }
+  }
+
+  private async doRefreshTokens (): Promise<void> {
     if (!this.auth) throw new Error('Session not initialized')
 
     try {
       const { csrfToken, sessionId } = await fetchTokens(this.auth.cookies)
       this.auth.csrfToken = csrfToken
       this.auth.sessionId = sessionId
-      logger.info('Session tokens refreshed')
+      this.lastTokenRefreshTs = Date.now()
+      this.refreshCount++
+      logger.info({ refreshCount: this.refreshCount }, 'Session tokens refreshed')
     } catch (err) {
       logger.error({ err }, 'Failed to refresh tokens')
       throw err
     }
+  }
+
+  /**
+   * Update cookies at runtime (e.g. from admin endpoint) and re-fetch tokens.
+   */
+  async updateCookies (storageStateJson: string): Promise<void> {
+    const storageState = JSON.parse(storageStateJson)
+    const cookies = extractCookiesFromStorage(storageState)
+    this.rawStorageState = storageState
+
+    const { csrfToken, sessionId } = await fetchTokens(cookies)
+    this.auth = { cookies, csrfToken, sessionId }
+    this.lastTokenRefreshTs = Date.now()
+    this.refreshCount++
+
+    this.stopKeepAlive()
+    this.startKeepAlive()
+
+    logger.info('Session cookies updated and tokens refreshed')
   }
 
   getAuth (): AuthTokens {
@@ -128,6 +188,30 @@ export class SessionManager {
 
   isInitialized (): boolean {
     return this.auth !== null
+  }
+
+  getStatus (): SessionStatus {
+    const now = Date.now()
+    let cookieExpiry: number | null = null
+
+    if (this.rawStorageState && typeof this.rawStorageState === 'object' && 'cookies' in this.rawStorageState) {
+      const cookies = (this.rawStorageState as { cookies?: Array<{ name?: string; expires?: number }> }).cookies || []
+      const sidCookie = cookies.find(c => c.name === 'SID')
+      if (sidCookie?.expires) {
+        cookieExpiry = Math.floor(sidCookie.expires * 1000)
+      }
+    }
+
+    return {
+      initialized: this.auth !== null,
+      lastTokenRefresh: this.lastTokenRefreshTs,
+      tokenAge: this.lastTokenRefreshTs ? Math.floor((now - this.lastTokenRefreshTs) / 1000) : null,
+      cookieExpiry,
+      nextRefresh: this.lastTokenRefreshTs
+        ? this.lastTokenRefreshTs + TOKEN_REFRESH_INTERVAL_MS
+        : null,
+      refreshCount: this.refreshCount,
+    }
   }
 
   async saveStorageState (storageState: object): Promise<void> {
@@ -143,11 +227,29 @@ export class SessionManager {
     logger.info('Storage state saved')
   }
 
-  destroy (): void {
+  private startKeepAlive (): void {
+    this.tokenRefreshInterval = setInterval(async () => {
+      try {
+        await this.refreshTokens()
+      } catch (err) {
+        logger.warn({ err }, 'Keep-alive token refresh failed — cookies may be expired')
+      }
+    }, TOKEN_REFRESH_INTERVAL_MS)
+
+    if (this.tokenRefreshInterval.unref) {
+      this.tokenRefreshInterval.unref()
+    }
+  }
+
+  private stopKeepAlive (): void {
     if (this.tokenRefreshInterval) {
       clearInterval(this.tokenRefreshInterval)
       this.tokenRefreshInterval = null
     }
+  }
+
+  destroy (): void {
+    this.stopKeepAlive()
     this.auth = null
   }
 }
