@@ -60,15 +60,42 @@ app.get('/health', (_req, res) => {
 
 const sessionManager = new SessionManager(config.notebookLm.sessionStorePath)
 let adapter: NotebookLMAdapter | undefined
+let initInProgress = false
+
+const INIT_MAX_RETRIES = 5
+const INIT_BASE_DELAY_MS = 3000
 
 async function initializeNotebookLM (): Promise<void> {
-  try {
-    await sessionManager.initialize()
-    adapter = new NotebookLMAdapter(sessionManager)
-    logger.info('NotebookLM adapter ready')
-  } catch (err) {
-    logger.warn({ err }, 'NotebookLM adapter not available. Only ping tool will work. Set NOTEBOOKLM_AUTH_JSON or provide storage_state.json to enable notebook tools.')
+  if (initInProgress) return
+  initInProgress = true
+
+  for (let attempt = 1; attempt <= INIT_MAX_RETRIES; attempt++) {
+    try {
+      await sessionManager.initialize()
+      adapter = new NotebookLMAdapter(sessionManager)
+      logger.info('NotebookLM adapter ready')
+      initInProgress = false
+      return
+    } catch (err) {
+      const delay = Math.min(INIT_BASE_DELAY_MS * Math.pow(2, attempt - 1), 30000)
+      logger.warn({ err, attempt, nextRetryMs: delay }, `NotebookLM init failed (attempt ${attempt}/${INIT_MAX_RETRIES}), retrying in ${delay}ms`)
+      if (attempt < INIT_MAX_RETRIES) {
+        await new Promise(resolve => setTimeout(resolve, delay))
+      }
+    }
   }
+
+  initInProgress = false
+  logger.error('NotebookLM init exhausted all retries. Use /admin/update-cookies or wait for next request to retry.')
+}
+
+async function ensureAdapter (): Promise<NotebookLMAdapter | undefined> {
+  if (adapter) return adapter
+  if (!initInProgress) {
+    logger.info('Adapter not available, attempting lazy initialization')
+    await initializeNotebookLM()
+  }
+  return adapter
 }
 
 app.post('/admin/update-cookies', authMiddleware, async (req, res) => {
@@ -113,7 +140,8 @@ function createConfiguredServer () {
   return server
 }
 
-app.post('/mcp', authMiddleware, (req, res) => {
+app.post('/mcp', authMiddleware, async (req, res) => {
+  await ensureAdapter()
   handleMcpPost(req, res, createConfiguredServer)
 })
 

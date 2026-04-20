@@ -232,7 +232,13 @@ export class SessionManager {
       try {
         await this.refreshTokens()
       } catch (err) {
-        logger.warn({ err }, 'Keep-alive token refresh failed — cookies may be expired')
+        logger.warn({ err }, 'Keep-alive token refresh failed, attempting full re-initialization')
+        try {
+          await this.initialize()
+          logger.info('Keep-alive: full re-initialization succeeded')
+        } catch (reinitErr) {
+          logger.error({ reinitErr }, 'Keep-alive: full re-initialization also failed — cookies may be expired')
+        }
       }
     }, TOKEN_REFRESH_INTERVAL_MS)
 
